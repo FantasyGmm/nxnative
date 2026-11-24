@@ -111,6 +111,9 @@ int main(void) { @autoreleasepool {
         uint32_t c1w; memcpy(&c1w, r.c1, 4); check("B fragment: first c1 word = −√1.5 (0xbf9cc471)", 0xbf9cc471u, c1w);
         memcpy(&c1w, r.c1 + 252, 4); check("B fragment: last c1 word zero", 0, c1w);
         check("B fragment: reads driver bank c0", 1, r.drv_read[0]); check("B fragment: reads driver bank c2", 1, r.drv_read[2]);
+        check("anisotropy: parsing leaves sampler unpaired", 0, r.b[8].aniso_tex);
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: named separate sampler's texture", 8, r.b[8].aniso_tex);
         struct { int i, kind, reg, aid, rw, dtt, dpf; } w[] = {
             {0, NVN_RB_SUPPORT, 0, 0, 0, -1, -1}, {1, C, 10, 1, 0, -1, -1}, {2, NVN_RB_C1, 0, 4, 0, -1, -1}, {3, NVN_RB_DRV0, 0, 7, 0, -1, -1},
             {4, NVN_RB_DRV2, 0, 8, 0, -1, -1}, {5, NVN_RB_SBUFP, 4, 11, 0, -1, -1}, {6, TB, 8, 13, 0, -1, -1}, {7, T, 41, 14, 0, 2, F},
@@ -150,6 +153,10 @@ int main(void) { @autoreleasepool {
         check("B handle array: single texture n", 0, r.b[0].n); check("B handle array: single texture offset", 16, r.b[0].off); check("B handle array: single sampler n", 0, r.b[1].n);
         check("B handle array: texture kind", NVN_RB_TEXU, r.b[2].kind); check("B handle array: texture n", 32, r.b[2].n); check("B handle array: texture dummy type 2D", 2, r.b[2].dtt); check("B handle array: texture slot", 11, r.b[2].reg);
         check("B handle array: sampler kind", NVN_RB_SAMPU, r.b[3].kind); check("B handle array: sampler n", 32, r.b[3].n); check("B handle array: bindless", 1, r.bindless);
+        check("anisotropy: parsing leaves UBO samplers unpaired", 0, r.b[1].aniso_tex | r.b[3].aniso_tex);
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: named uniform sampler's texture", 1, r.b[1].aniso_tex);
+        check("anisotropy: matching UBO array elements", 3, r.b[3].aniso_tex);
         printf("%-60s %s\n", "B array of 32 handles in uniform slot 11 (texture + sampler)", fail == f1 ? "✓" : "✗");
     }
     {   int f1 = fail;   // a SeparateSamplerId (handle type 2, The Witcher 3): the texture from c2, the sampler ID itself in word 0 of uniform slot 7
@@ -160,7 +167,58 @@ int main(void) { @autoreleasepool {
         check("B sampler ID: conversion succeeds", 0, nvn_refl_from_json(j, &r, err, sizeof err));
         check("B sampler ID: kind", NVN_RB_SAMPU, r.b[1].kind); check("B sampler ID: uniform slot", 7, r.b[1].reg); check("B sampler ID: raw_id", 1, r.b[1].raw_id);
         check("B sampler ID: a handle's sampler has no raw_id", 0, r.b[2].raw_id);
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: named raw sampler ID's texture", 1, r.b[1].aniso_tex);
+        check("anisotropy: sampler without matching name", 0, r.b[2].aniso_tex);
         printf("%-60s %s\n", "B separate sampler ID in uniform slot 7 (raw_id)", fail == f1 ? "✓" : "✗");
+    }
+    {   // Only the exact MSL member names prove scalar pairs, not the argument index or NVN slot.
+        NSDictionary *tex = @{@"kind": @"tex", @"reg": @0, @"arg_id": @4, @"msl_name": @"fp_t_tcb_8", @"msl_type": @"texture2d<float>"};
+        NSDictionary *samp = @{@"kind": @"samp_tex", @"reg": @0, @"arg_id": @5, @"msl_name": @"fp_t_tcb_8Smplr", @"msl_type": @"sampler"};
+        NSDictionary *twin = @{@"kind": @"samp_tex", @"reg": @0, @"arg_id": @6, @"msl_name": @"fp_t_tcb_8Smplr" DMSH_BORDER_TWIN, @"msl_type": @"sampler", @"border_bit": @0};
+        NSMutableArray *bindings = [NSMutableArray arrayWithArray:@[samp, twin, tex]];
+        NSDictionary *j = @{@"route": @"B", @"bindings": bindings};
+        check("anisotropy: reordered bindings convert", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        check("anisotropy: parsing leaves border twin unpaired", 0, r.b[1].aniso_tex);
+        nvn_refl_pair_samplers(j, &r);
+        nvn_refl copy = r;
+        check("anisotropy: combined sampler's texture", 3, copy.b[0].aniso_tex);
+        check("anisotropy: border twin's texture", 3, copy.b[1].aniso_tex);
+        NSMutableDictionary *other = [tex mutableCopy]; other[@"arg_id"] = @7;
+        [bindings setArray:@[samp, tex, other]];
+        check("anisotropy: duplicate texture converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: duplicate texture does not pair", 0, r.b[0].aniso_tex);
+        NSMutableDictionary *dup = [samp mutableCopy]; dup[@"arg_id"] = @7; bindings[2] = dup;
+        check("anisotropy: duplicate sampler converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: neither duplicate sampler pairs", 0, r.b[0].aniso_tex | r.b[2].aniso_tex);
+        [bindings removeLastObject]; bindings[1] = other;
+        other[@"msl_name"] = @"fp_t_tcb_A";
+        check("anisotropy: same slot but wrong name converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: same slot does not prove a pair", 0, r.b[0].aniso_tex);
+        [other removeObjectForKey:@"msl_name"];
+        check("anisotropy: missing texture name converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: missing name does not prove a pair", 0, r.b[0].aniso_tex);
+    }
+    {   // Equal extents and matching handle offsets are required for the driver-table arrays.
+        NSDictionary *tex = @{@"kind": @"tex_c2a", @"off": @0, @"arg_id": @0, @"msl_name": @"fp_t2das_cb2_0", @"msl_type": @"array<depth2d_array<float>, 8>"};
+        NSMutableDictionary *samp = [@{@"kind": @"samp_c2a", @"off": @0, @"arg_id": @8, @"msl_name": @"fp_t2das_cb2_0Smplr", @"msl_type": @"array<sampler, 8>"} mutableCopy];
+        NSDictionary *j = @{@"route": @"B", @"bindings": @[tex, samp]};
+        check("anisotropy: driver-table arrays convert", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        check("anisotropy: parsing leaves c2 sampler unpaired", 0, r.b[1].aniso_tex);
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: matching driver-table array elements", 1, r.b[1].aniso_tex);
+        samp[@"off"] = @8;
+        check("anisotropy: inconsistent offset converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: inconsistent offset does not pair", 0, r.b[1].aniso_tex);
+        samp[@"off"] = @0; samp[@"msl_type"] = @"array<sampler, 7>";
+        check("anisotropy: inconsistent extent converts", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        nvn_refl_pair_samplers(j, &r);
+        check("anisotropy: inconsistent extent does not pair", 0, r.b[1].aniso_tex);
     }
     {   int f1 = fail;   // handles in a uniform buffer beyond textures: Unreal Engine 5.4 on the Switch 2 keeps images and buffer textures there, and ORs a texture and a sampler word in either order
         NSDictionary *j = @{@"route": @"B", @"bindings": @[

@@ -33,6 +33,40 @@ static int arr_len(NSString *ty, NSString **el) {
     return [[ty substringWithRange:NSMakeRange(NSMaxRange(c), ty.length - 1 - NSMaxRange(c))] intValue];
 }
 
+// SPIRV-Cross splits a sampled image into <name> and <name>Smplr; border_emu adds a scalar sampler twin.
+// Keep the host-only link only for unique names and shapes the replay can resolve element for element.
+void nvn_refl_pair_samplers(NSDictionary *j, nvn_refl *o) {
+    _Static_assert(NVN_REFL_MAXB <= UINT8_MAX, "aniso_tex must hold every reflection binding index plus one");
+    NSArray *bs = j[@"bindings"];
+    if (![bs isKindOfClass:[NSArray class]] || !bs.count || bs.count != (NSUInteger)o->nb) return;
+    NSMutableDictionary *named = [NSMutableDictionary dictionaryWithCapacity:bs.count];
+    for (int i = 0; i < o->nb; i++) {
+        NSString *name = bs[i][@"msl_name"];
+        if ([name isKindOfClass:[NSString class]] && name.length) named[name] = named[name] ? @0 : @(i + 1);
+    }
+    for (int i = 0; i < o->nb; i++) {
+        nvn_rbind *s = &o->b[i];
+        if (s->kind != NVN_RB_SAMP && s->kind != NVN_RB_SAMPT && s->kind != NVN_RB_SAMPU && s->kind != NVN_RB_SAMPI && s->kind != NVN_RB_SAMPA) continue;
+        NSString *name = bs[i][@"msl_name"], *suffix = s->bw ? @"Smplr" DMSH_BORDER_TWIN : @"Smplr";
+        if (![name isKindOfClass:[NSString class]] || name.length <= suffix.length || ![name hasSuffix:suffix] || [named[name] intValue] != i + 1) continue;
+        int ti = [named[[name substringToIndex:name.length - suffix.length]] intValue] - 1;
+        if (ti < 0) continue;
+        const nvn_rbind *t = &o->b[ti];
+        if (s->n != t->n) continue;
+        NSString *st = bs[i][@"msl_type"], *tt = bs[ti][@"msl_type"], *se, *te;
+        if (![st isKindOfClass:[NSString class]] || ![tt isKindOfClass:[NSString class]]) continue;
+        if (arr_len(st, &se) != s->n || arr_len(tt, &te) != t->n || ![se isEqualToString:@"sampler"] ||
+            !([te hasPrefix:@"texture"] || [te hasPrefix:@"depth"])) continue;
+        if (!s->n) {
+            if (t->kind != NVN_RB_TEX && t->kind != NVN_RB_TEXU) continue;
+        } else if (s->kind == NVN_RB_SAMPU) {
+            // Both advance through the same UBO handles in 8-byte steps. A fixed c2 sampler word can supply all elements.
+            if (t->kind != NVN_RB_TEXU || s->raw_id || s->reg != t->reg || s->off != t->off || t->soff || (s->soff && s->sreg != DMSH_SREG_C2)) continue;
+        } else if (s->kind != NVN_RB_SAMPA || t->kind != NVN_RB_TEXA || s->off != t->off || s->soff != t->soff) continue;
+        s->aniso_tex = (uint8_t)(ti + 1);
+    }
+}
+
 // Whether a storage buffer binding may be written: current B reflection carries the translator's write flag ("rw"); old samples without it fall back to SPIRV-Cross's const device qualifier.
 static int sbuf_rw(NSDictionary *b) { id rw = b[@"rw"]; if (rw) return [rw boolValue]; id ty = b[@"msl_type"]; return !([ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"const "]); }
 int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {

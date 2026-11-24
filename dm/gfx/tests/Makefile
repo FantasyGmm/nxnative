@@ -585,6 +585,16 @@ t_border: t_border.m $(MTL_T_DEP)
 check_t_border: t_border
 	MTL_DEBUG_LAYER=1 ./t_border
 	DM_TEST_BORDER="$(CURDIR)/t_border" MTL_DEBUG_LAYER=1 python3 -m unittest test_dmsh_border.py
+t_anisotropy: t_anisotropy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_anisotropy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_anisotropy
+check_t_anisotropy: t_anisotropy
+	env -u DM_NVN_ANISOTROPY MTL_DEBUG_LAYER=1 ./$< 0
+	@set -e; for cap in 0 1 2 4 8 16; do \
+		DM_NVN_ANISOTROPY=$$cap MTL_DEBUG_LAYER=1 ./$< $$cap; \
+	done; for invalid in '' 3 32 -4 4x 04 +4 ' 4' '4 '; do \
+		DM_NVN_ANISOTROPY="$$invalid" MTL_DEBUG_LAYER=1 ./$< 0; \
+	done
 t_view_levels: t_view_levels.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_view_levels.m $(MTL_T_SRC) $(FW)
 check_t_view_levels: RUN_ENV = MTL_DEBUG_LAYER=1

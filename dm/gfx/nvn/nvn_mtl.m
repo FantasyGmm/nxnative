@@ -1079,7 +1079,15 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+static NSUInteger g_sampler_anisotropy;   // 0 keeps the game's sampler settings
+
 static void mtl_init_once(void) {
+    const char *aniso = getenv("DM_NVN_ANISOTROPY");
+    if (aniso) {
+        static const char *const values[] = { "1", "2", "4", "8", "16" };
+        for (unsigned i = 0; i < sizeof values / sizeof values[0]; i++)
+            if (!strcmp(aniso, values[i])) { g_sampler_anisotropy = 1u << i; break; }
+    }
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
     const char *link = getenv("DM_PRESENT_LINK");
     g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1; g_present_link_env = link != NULL;   // Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
@@ -7694,6 +7702,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
     char err[160];
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("[RED] shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
+    if (g_sampler_anisotropy) nvn_refl_pair_samplers(j, &o->rf);
     if (o->rf.dyn && !DM_GAME_TEX_DYN_SLOTS) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
         MLOG("[RED] shader %s reflection conversion failed: a texture handle the translator could not trace to one slot (profile key tex_dyn_slots off)", pc.UTF8String); return nil; }
@@ -8043,6 +8052,10 @@ static inline uint64_t tid_ser(int tid) { return tid > 0 && tid < (1 << 20) ? at
 static inline uint64_t h_ser(uint64_t h) { return tid_ser((int)(h & 0xfffff)); }
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
 static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
+// The optional cap and its twin are cached separately: one sampler ID can read views with and without mipmaps.
+typedef struct { void *view, *twin; uint64_t rid, twin_rid; } samp_override;
+static samp_override *g_saniso;
+static int g_ns_aniso;
 static _Atomic int g_border_any;   // a sampler needing corrections has been registered (sticky). Set before its lazy Metal creation, so its very first draw keeps the corrections
 static int border_need(NvShader *sh, int nvn_stage);
 // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
@@ -8404,6 +8417,14 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
         memset(g_sview_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview_w); memset(g_srid_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid_w); g_nsreg = n; }
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
+    if (id_ < g_ns_aniso) {
+        samp_override *a = &g_saniso[id_];
+        if (a->view) defer_obj_unref((__bridge id)a->view);
+        if (a->twin) defer_obj_unref((__bridge id)a->twin);
+        if (a->view) CFRelease(a->view);
+        if (a->twin) CFRelease(a->twin);
+        *a = (samp_override){0};
+    }
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
     int bn, bw; float k[4]; const uint8_t wrap[3] = {sp->ws, sp->wt, sp->wr};
     if (nvn_border(sp->border, wrap, sp->reduction, &bn, &bw, k)) atomic_store(&g_border_any, 1);
@@ -8827,11 +8848,10 @@ static id<MTLSamplerState> samp_pool_zero(void) {   // Caller holds g_rmu
     }
     return s;
 }
-static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
-    if (sid == SAMP_POOL_ZERO) return samp_pool_zero();
-    if (g_spool_n && sid >= g_spool_n) { if (!g_stat_samp_oob++) MLOG("sampler ID %d outside the pool (capacity %d) treated as an empty slot", sid, g_spool_n); return nil; }
-    if (sid < 0 || sid >= g_nsreg || !g_sreg_ok[sid]) { RED_ONCE(12, "sampler ID %d not registered", sid); return nil; }
-    if (g_sview[sid]) return (__bridge id<MTLSamplerState>)g_sview[sid];
+static NSUInteger samp_guest_cap(samp_par p) {
+    return p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+}
+static id<MTLSamplerState> samp_make(int sid, NSUInteger cap, samp_override *a) {   // Caller holds g_rmu
     samp_par p = g_sreg[sid];
     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
     d.magFilter = p.magf ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -8840,7 +8860,7 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.lodBias = p.lod_bias < -16 ? -16 : p.lod_bias > 15.99f ? 15.99f : p.lod_bias;   // SetLodBias: Maxwell's sampler bias, Metal 26's range [-16, 15.99]
-    d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+    d.maxAnisotropy = cap;
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     // Reduction (NVN 1 min / 2 max): the minimum or maximum of the texels a filtered sample covers, per channel (Metal 26). Pokémon Legends: Z-A builds its depth pyramid with a min sampler
     // (151607c7a92386cc reads the level above at an explicit LOD) and tests occlusion boxes against it; averaged, the pyramid is nearer than the scene at depth edges. Metal ignores the reduction
@@ -8855,13 +8875,50 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     d.borderColor = (MTLSamplerBorderColor)bn;
     d.supportArgumentBuffers = YES;
     id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
-    if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
+    id<MTLSamplerState> t = nil;
     if (s && twin) {
-        d.borderColor = (MTLSamplerBorderColor)bw; id<MTLSamplerState> t = [g_dev newSamplerStateWithDescriptor:d];
-        if (t) { g_sview_w[sid] = (void *)CFBridgingRetain(t); g_srid_w[sid] = t.gpuResourceID._impl; memcpy(g_sbk[sid], k, sizeof k); }
+        d.borderColor = (MTLSamplerBorderColor)bw; t = [g_dev newSamplerStateWithDescriptor:d];
+        if (a && !t) return nil;   // Do not mix a primary at one cap with a twin at another.
+        if (t) memcpy(g_sbk[sid], k, sizeof k);
         static int nlog; if (nlog++ < 16) MLOG("sampler ID %d: border colour %g,%g,%g,%g, which Metal lacks: Metal colour %d, corrected in the shaders through a twin of colour %d", sid, p.border[0], p.border[1], p.border[2], p.border[3], bn, bw);
     }
+    if (a) {
+        if (s) { a->view = (void *)CFBridgingRetain(s); a->rid = s.gpuResourceID._impl; }
+        if (t) { a->twin = (void *)CFBridgingRetain(t); a->twin_rid = t.gpuResourceID._impl; }
+    } else {
+        if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
+        if (t) { g_sview_w[sid] = (void *)CFBridgingRetain(t); g_srid_w[sid] = t.gpuResourceID._impl; }
+    }
     return s;
+}
+static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
+    if (sid == SAMP_POOL_ZERO) return samp_pool_zero();
+    if (g_spool_n && sid >= g_spool_n) { if (!g_stat_samp_oob++) MLOG("sampler ID %d outside the pool (capacity %d) treated as an empty slot", sid, g_spool_n); return nil; }
+    if (sid < 0 || sid >= g_nsreg || !g_sreg_ok[sid]) { RED_ONCE(12, "sampler ID %d not registered", sid); return nil; }
+    if (g_sview[sid]) return (__bridge id<MTLSamplerState>)g_sview[sid];
+    return samp_make(sid, samp_guest_cap(g_sreg[sid]), NULL);
+}
+static const samp_override *samp_aniso_state(int sid) {   // Caller holds g_rmu
+    if (sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid] || (g_spool_n && sid >= g_spool_n)) return NULL;
+    if (sid < g_ns_aniso && g_saniso[sid].view) return &g_saniso[sid];
+    samp_par p = g_sreg[sid];
+    if (p.magf != NVN_MAG_FILTER_LINEAR ||
+        (p.minf != NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST && p.minf != NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR) ||
+        p.cmp_mode != NVN_COMPARE_MODE_NONE || p.reduction != NVN_SAMPLER_REDUCTION_AVERAGE ||
+        !(p.lod_min <= 0 && p.lod_max >= 1) || samp_guest_cap(p) == g_sampler_anisotropy)
+        return NULL;
+    if (sid >= g_ns_aniso) {
+        g_saniso = realloc_or_die(g_saniso, (size_t)g_nsreg * sizeof *g_saniso, "the anisotropic sampler states");
+        memset(g_saniso + g_ns_aniso, 0, (g_nsreg - g_ns_aniso) * sizeof *g_saniso);
+        g_ns_aniso = g_nsreg;
+    }
+    samp_override *a = &g_saniso[sid];
+    return samp_make(sid, g_sampler_anisotropy, a) ? a : NULL;
+}
+static int fmt_int_or_ds(MTLPixelFormat f);
+static int samp_aniso_view(id<MTLTexture> t) {
+    return t && t.mipmapLevelCount > 1 && !fmt_int_or_ds(t.pixelFormat) &&
+           (t.textureType == MTLTextureType2D || t.textureType == MTLTextureType2DArray);
 }
 static inline __attribute__((always_inline)) void *samp_fast(int sid) {
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid] && g_sview[sid]) return g_sview[sid];
@@ -8872,6 +8929,26 @@ static inline int samp_known(int sid) {
 }
 static inline uint64_t samp_rid(int sid) {
     return sid == SAMP_POOL_ZERO ? g_samp_zero_rid : sid > 0 && sid < g_nsreg ? g_srid[sid] : 0;
+}
+static inline id<MTLSamplerState> samp_pick(int sid, int aniso, int twin, uint64_t *rid, int *correct) {
+    if (correct) *correct = 0;
+    if (!sid) return nil;
+    const samp_override *a = aniso ? samp_aniso_state(sid) : NULL;
+    if (a) {
+        if (twin && a->twin) {
+            *rid = a->twin_rid; *correct = 1;
+            return (__bridge id<MTLSamplerState>)a->twin;
+        }
+        *rid = a->rid;
+        return (__bridge id<MTLSamplerState>)a->view;
+    }
+    void *s = samp_fast(sid);
+    if (twin && s && sid > 0 && g_sview_w[sid]) {
+        *rid = g_srid_w[sid]; *correct = 1;
+        return (__bridge id<MTLSamplerState>)g_sview_w[sid];
+    }
+    *rid = samp_rid(sid);
+    return (__bridge id<MTLSamplerState>)s;
 }
 
 // ---------- Argument buffer blocks: written by the CPU as a submission is encoded, reclaimed after the GPU completes ----------
@@ -14885,9 +14962,15 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
     // The length table of the bounded storage buffers (dmsh_abi.h DMSH_SBLEN_BANK, sblen_put), filled as they are encoded; 0 for a slot with no buffer, which reads nothing
     uint32_t *sblen = NULL; uint64_t sblen_gpu = 0; __strong id<MTLBuffer> sblen_buf = nil;
     if (sh->rf.sblen) { arena_at at = arena_take(DMSH_SBLEN_SLOTS * 8u, &sblen_buf); sblen = (uint32_t *)(void *)at.cpu; sblen_gpu = at.gpu; memset(sblen, 0, DMSH_SBLEN_SLOTS * 8u); }
+    // Defer samplers with a known texture so we can use the actual, final view (which may be
+    // a one-mip feedback snapshot or subview). Unpaired and independently indexed pools keep the game's sampler.
+    uint8_t aniso_view[NVN_REFL_MAXARG], aniso_wait[NVN_REFL_MAXB]; int aniso_n = 0;
+    if (g_sampler_anisotropy) memset(aniso_view, 0, sizeof aniso_view);
     os_unfair_lock_lock(&g_rmu);   // The texture / sampler registration tables may be being grown or rewritten by the game thread
-    for (int i = 0; i < sh->rf.nb; i++) {
-        const nvn_rbind *b = &sh->rf.b[i];
+    for (int i = 0; i < sh->rf.nb + aniso_n; i++) {
+        const nvn_rbind *b = &sh->rf.b[i < sh->rf.nb ? i : aniso_wait[i - sh->rf.nb]];
+        if (g_sampler_anisotropy && b->aniso_tex && i < sh->rf.nb) { aniso_wait[aniso_n++] = (uint8_t)i; continue; }
+        const uint8_t *aniso = i >= sh->rf.nb ? aniso_view + sh->rf.b[b->aniso_tex - 1].aid : NULL;
         int reg = b->reg, aid = b->aid;
         if (b->kind >= NVN_RB_RT_SCENE && b->kind <= NVN_RB_RT_BANK3) {
             if (!rt || nvn_stage != NVN_RT_RESOURCE_STAGE) MDIE("[RED] RT argument requested outside ray-tracing dispatch");
@@ -14922,8 +15005,8 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             for (int k = 0; k < b->n; k++) {   // only registered IDs are looked up: most elements are other data the shader never picks as a handle
                 int sid = sampu_id(nvn_stage, b, k); if (!samp_known(sid)) sid = 0;
                 if (bl && (sid || (b->soff && b->sreg == DMSH_SREG_C2 && !k))) PD("B %llu st%d sampu [%d] sid=%d%s", g_stat_pass, nvn_stage, k, sid, b->soff && b->sreg == DMSH_SREG_C2 ? " from c2" : "");
-                __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
-                slots[aid + k] = ss ? samp_rid(sid) : dummy_samp_rid();
+                __unsafe_unretained id<MTLSamplerState> ss = samp_pick(sid, aniso && aniso[k], 0, &slots[aid + k], NULL);
+                if (!ss) slots[aid + k] = dummy_samp_rid();
                 USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             }
         } else if (b->kind == NVN_RB_TEXU && b->n) {   // an array of handles in a uniform buffer that the shader indexes at run time (Ryujinx's texture array from a buffer): element k = the handle
@@ -14938,16 +15021,18 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
                 if (bl && tid) PD("B %llu st%d texu [%d] tid=%d %s", g_stat_pass, nvn_stage, k, tid, tv ? "real" : "dummy");
                 if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(tid, t, &trid);   // see tbuf_shadow
                 slots[aid + k] = trid;
+                if (g_sampler_anisotropy && b->dpf == NVN_DPF_FLOAT) aniso_view[aid + k] = samp_aniso_view(t);
                 USE(t, MTLResourceUsageRead);
             }
             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
             int sid = bind_sid(nvn_stage, b);
-            __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
-            if (b->bw && ss && sid > 0 && g_sview_w[sid]) {   // a twin (dmsh_rewrite.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
-                ss = (__bridge id<MTLSamplerState>)g_sview_w[sid]; slots[aid] = g_srid_w[sid];
+            int correct;
+            __unsafe_unretained id<MTLSamplerState> ss = samp_pick(sid, aniso && *aniso, b->bw, &slots[aid], &correct);
+            if (correct) {   // a twin (dmsh_rewrite.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
                 bmask |= 1u << (b->bw - 1); memcpy(bk[b->bw - 1], g_sbk[sid], sizeof bk[0]);
-            } else slots[aid] = ss ? samp_rid(sid) : dummy_samp_rid();   // a twin of any other sampler is never sampled
+            }
+            if (!ss) slots[aid] = dummy_samp_rid();
             USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             if (bl && sid == SAMP_POOL_ZERO) PD("B %llu st%d samp reg%d sid=0 (reserved pool sampler)", g_stat_pass, nvn_stage, reg);
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // g_rmu is already held in this section
@@ -14974,6 +15059,7 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt % DMY_NT][b->dpf & 3]; }
             else if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(tid, t, &trid);   // see tbuf_shadow
             slots[aid] = trid;
+            if (g_sampler_anisotropy && b->dpf == NVN_DPF_FLOAT) aniso_view[aid] = samp_aniso_view(t);
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG || b->kind == NVN_RB_IMGU) {   // Storage image: NVN image slot r (BindImages) ↔ D3D u_r, or its handle in a uniform buffer (IMGU)
             if (rt) {
@@ -15086,6 +15172,7 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
                     else t = tbuf_shadow(tid, t, &trid);   // see tbuf_shadow
                 }
                 slots[aid + k] = trid;
+                if (g_sampler_anisotropy && b->dpf == NVN_DPF_FLOAT) aniso_view[aid + k] = samp_aniso_view(t);
                 USE(t, MTLResourceUsageRead);
             }
             if (!(sh->logged & 8)) { sh->logged |= 8; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d driver-table handles from c2 byte %#x, elements %#llx hold textures", sh->key, nvn_stage, b->n, b->off, (unsigned long long)real); }
@@ -15094,8 +15181,8 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             for (int k = 0; k < b->n; k++) {
                 uint64_t h = c2_handle(nvn_stage, b->off + 8u * k) | sw;
                 int sid = b->soff && !sw ? (int)(h >> 20) : bound_samp_id(h);
-                __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
-                slots[aid + k] = ss ? samp_rid(sid) : dummy_samp_rid();
+                __unsafe_unretained id<MTLSamplerState> ss = samp_pick(sid, aniso && aniso[k], 0, &slots[aid + k], NULL);
+                if (!ss) slots[aid + k] = dummy_samp_rid();
                 USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             }
         } else if (b->kind == NVN_RB_SAMPD) {   // its samplers: element k = the separate sampler in slot k, else the sampler of a combined handle in texture slot k
@@ -18720,7 +18807,10 @@ static void draw_tex(const p_draw_tex *c) {
     }
     os_unfair_lock_lock(&g_rmu);
     uint64_t h = bound_handle(c->h);
-    id<MTLTexture> t = tex_by_id((int)(h & 0xfffff)); id<MTLSamplerState> ss = samp_by_id(bound_samp_id(h));
+    id<MTLTexture> t = tex_by_id((int)(h & 0xfffff));
+    int sid = bound_samp_id(h);
+    const samp_override *a = g_sampler_anisotropy && samp_aniso_view(t) && fam_is_valid(t) ? samp_aniso_state(sid) : NULL;
+    id<MTLSamplerState> ss = a ? (__bridge id<MTLSamplerState>)a->view : samp_by_id(sid);
     os_unfair_lock_unlock(&g_rmu);
     if (!t || !ss) { RED_ONCE(122, "DrawTexture: texture handle %#llx has no texture or sampler", (unsigned long long)c->h); return; }
     if (t.textureType != MTLTextureType2D || fmt_int_or_ds(t.pixelFormat)) { RED_ONCE(123, "DrawTexture: source type %lu format %lu not drawn (2D float / unorm only)", (unsigned long)t.textureType, (unsigned long)t.pixelFormat); return; }

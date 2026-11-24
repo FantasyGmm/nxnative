@@ -368,6 +368,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `samp_by_id` (NVN) and `vkCreateSampler` set it, clamped to that range (Vulkan to the ±15 the device reports as `maxSamplerLodBias`).
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md) (the Vulkan red line). MacNativeGames uses the property for its own MetalFX bias, which pointed to it.
 
+### NVN sampler anisotropy override
+
+- **Symptom:** texture detail can look soft on surfaces viewed at a shallow angle, such as floors or roads.
+- **Cause:** the game chooses how much anisotropic filtering its samplers use; a low limit can lose detail at shallow angles.
+- **Setting:** at Metal initialization, `DM_NVN_ANISOTROPY` accepts exactly `0`, `1`, `2`, `4`, `8` or `16`; unset or invalid values behave like `0` and keep the game's setting. A nonzero value sets Metal's `maxAnisotropy` to that exact cap, even if the game requested more. Replay selects the state per binding, and a border-colour twin uses the same cap as its primary sampler. The registered guest state and host-owned samplers are unchanged. See [Anisotropic filtering](../settings.md#anisotropic-filtering) for the launcher setting.
+- **Eligibility:** the sampler must use linear minification and magnification, a nearest or linear mip filter, average reduction, no comparison, and an LOD range that includes levels 0 and 1 (minimum at most 0, maximum at least 1). The final bound view must be a real 2D or 2D-array colour texture with more than one mip level. The same rule applies to combined handles, known separate texture and sampler pairs, and known pairs from uniform-buffer handles. Single-level views, ambiguous or unpaired samplers, and independently indexed sampler pools keep the game's cap.
+- **Prior report:** [CatPawPrint's comment on PR #335](https://github.com/seedds/nxnative/pull/335#:~:text=Every%20edge%20turned%20jagged) describes jagged silhouettes in Breath of the Wild when a sampler-only override raised anisotropy on a single-level texture read by the anti-aliasing pass. In that prototype, gating on the bound view's mip count restored smooth edges.
+
 ### Border colours Metal has no sampler state for
 
 - **Symptom:** whatever a game keeps in a texture that it samples past its edge with clamp-to-border reads the wrong value there: grass flattened along Link's path in Tears of the Kingdom, its bend map filled with "bent" wherever the window scrolled.

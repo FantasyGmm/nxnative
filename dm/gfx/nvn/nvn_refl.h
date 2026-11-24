@@ -50,6 +50,7 @@ typedef struct {
                              // TEX / TEXU / TEXD / TEXA with f1d: row-fetch leads, followed by the logical widths (one of each per element)
                              // (nvn_mtl.m tbuf_lead); TEXD / TEXA of buffer textures: element 0's, element k's at tbx - 1 + k; 0 = none
     uint8_t sbx;             // SBUFU / SBUFQ: the binding's slot in the shader's length table (SBLEN, dmsh_abi.h DMSH_SBLEN_BANK) + 1, whose words bound its accesses (nvn_mtl.m sblen_put); 0 = unbounded
+    uint8_t aniso_tex;       // Sampler's paired texture binding: index in nvn_refl.b + 1, or 0 when not proven; finite pairs match element for element
 } nvn_rbind;
 typedef struct {
     int nb, abi, nv;         // Binding count, argument buffer slot, vertex input count
@@ -101,4 +102,6 @@ typedef struct {
 #import <Foundation/Foundation.h>
 // 0 on success; on failure returns non-0 and writes the reason into err (unknown binding type, fixed-length limit exceeded, missing field)
 int nvn_refl_from_json(NSDictionary *j, nvn_refl *out, char *err, int errlen);
+// Opt in to host-only sampler pairing after successfully parsing the same reflection JSON into o.
+void nvn_refl_pair_samplers(NSDictionary *j, nvn_refl *o);
 #endif
